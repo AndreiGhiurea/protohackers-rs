@@ -1,0 +1,8 @@
+[package]
+name = "mob_in_the_middle_5"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.39.2", features = ["full"] }
+fancy-regex = "0.13.0"
