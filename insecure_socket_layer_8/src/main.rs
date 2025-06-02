@@ -1,258 +1,148 @@
-use std::{
-    io::{BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
-    str::FromStr,
-    thread,
-};
+mod isl;
 
-fn log_with_thread_id(message: &str) {
-    let thread_id = thread::current().id();
-    println!("[Thread {:?}] {}", thread_id, message);
+use isl::InsecureSocketLayer;
+use std::io;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
+
+fn get_most_toys(toys: String) -> Result<String, String> {
+    let parsed: Result<Vec<(u32, String)>, String> = toys
+        .split(',')
+        .map(|x| {
+            let mut parts = x.splitn(2, 'x');
+            let count = parts
+                .next()
+                .ok_or("Invalid input string")?
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| "Invalid input string")?;
+            let name = parts
+                .next()
+                .ok_or("Invalid input string")?
+                .trim()
+                .to_string();
+            Ok((count, name))
+        })
+        .collect();
+
+    let parsed = parsed?;
+    let most_toys = parsed
+        .into_iter()
+        .max_by_key(|(count, _)| *count)
+        .ok_or("Invalid input string")?;
+
+    Ok(format!("{}x {}\n", most_toys.0, most_toys.1))
 }
 
-#[derive(Clone)]
-enum CipherOp {
-    EndOfCipherSpec,
-    ReverseBits,
-    Xor(u8),
-    Xorpos,
-    Add(u8),
-    Addpos,
+async fn handle_client<S>(socket: S) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    //
+    // Create the socket layer.
+    //
+    let mut isl = InsecureSocketLayer::new(socket).await?;
+
+    //
+    // Process requests.
+    //
+    loop {
+        let request = isl.read().await?;
+
+        let response = get_most_toys(request)?;
+
+        isl.write(response).await?;
+    }
 }
 
-fn read_cipher(stream: &mut TcpStream) -> Vec<CipherOp> {
-    let mut cipher: Vec<CipherOp> = Vec::new();
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let listener = TcpListener::bind("0.0.0.0:10000").await?;
 
     loop {
-        let mut byte = [0u8; 1];
-        stream.read_exact(&mut byte).expect("Failed to read byte");
-
-        log_with_thread_id(&format!("Read cipher byte: {:#x}", byte[0]));
-
-        let cipher_op = match byte[0] {
-            0 => CipherOp::EndOfCipherSpec,
-            1 => CipherOp::ReverseBits,
-            2 => {
-                let mut xor_value = [0u8; 1];
-                stream
-                    .read_exact(&mut xor_value)
-                    .expect("Failed to read xor value");
-                log_with_thread_id(&format!("Xor value: {:#x}", xor_value[0]));
-                CipherOp::Xor(xor_value[0])
+        let (socket, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            match handle_client(socket).await {
+                Ok(_) => (),
+                Err(str) => println!("{}", str),
             }
-            3 => CipherOp::Xorpos,
-            4 => {
-                let mut add_value = [0u8; 1];
-                stream
-                    .read_exact(&mut add_value)
-                    .expect("Failed to read add value");
-                log_with_thread_id(&format!("Add value: {:#x}", add_value[0]));
-                CipherOp::Add(add_value[0])
-            }
-            5 => CipherOp::Addpos,
-            _ => {
-                let _ = stream.shutdown(std::net::Shutdown::Both);
-                panic!("Invalid cipher operation");
-            }
-        };
-
-        if let CipherOp::EndOfCipherSpec = cipher_op {
-            break;
-        }
-
-        cipher.push(cipher_op);
-    }
-
-    cipher
-}
-
-fn check_cipher_validity(cipher: Vec<CipherOp>) -> bool {
-    let sample_input = "Hello, World!";
-    let mut stream_pos = 0usize;
-    let mut valid = true;
-
-    let encoded = encode(sample_input.as_bytes(), cipher.clone(), &mut stream_pos);
-
-    if encoded == sample_input.as_bytes() {
-        valid = false;
-    }
-
-    stream_pos = 0;
-    let decoded = decode(&encoded, cipher.clone(), &mut stream_pos);
-
-    if decoded != sample_input {
-        panic!("Cipher decoding failed");
-    }
-
-    valid
-}
-
-fn encode(input: &[u8], cipher: Vec<CipherOp>, stream_pos: &mut usize) -> Vec<u8> {
-    let mut result = Vec::new();
-
-    for byte in input.bytes() {
-        let mut modified_byte = byte.expect("Failed to get byte");
-
-        for op in &cipher {
-            match op {
-                CipherOp::ReverseBits => {
-                    modified_byte = modified_byte.reverse_bits();
-                }
-                CipherOp::Xor(x) => {
-                    modified_byte ^= *x;
-                }
-                CipherOp::Xorpos => {
-                    modified_byte ^= (*stream_pos % 256) as u8;
-                }
-                CipherOp::Add(x) => {
-                    modified_byte = modified_byte.wrapping_add(*x);
-                }
-                CipherOp::Addpos => {
-                    modified_byte = modified_byte.wrapping_add((*stream_pos % 256) as u8);
-                }
-                _ => {}
-            }
-        }
-
-        *stream_pos += 1;
-        result.push(modified_byte);
-    }
-
-    result
-}
-
-fn decode(input: &[u8], cipher: Vec<CipherOp>, stream_pos: &mut usize) -> String {
-    let mut result = String::new();
-
-    for byte in input {
-        let mut modified_byte = *byte;
-
-        for op in cipher.iter().rev() {
-            match op {
-                CipherOp::ReverseBits => {
-                    modified_byte = modified_byte.reverse_bits();
-                }
-                CipherOp::Xor(x) => {
-                    modified_byte ^= *x;
-                }
-                CipherOp::Xorpos => {
-                    modified_byte ^= (*stream_pos % 256) as u8;
-                }
-                CipherOp::Add(x) => {
-                    modified_byte = modified_byte.wrapping_sub(*x);
-                }
-                CipherOp::Addpos => {
-                    modified_byte = modified_byte.wrapping_sub((*stream_pos % 256) as u8);
-                }
-                _ => {}
-            }
-        }
-
-        *stream_pos += 1;
-        result.push(modified_byte as char);
-    }
-
-    result
-}
-
-fn read_request_and_decode(
-    stream: &mut TcpStream,
-    cipher: Vec<CipherOp>,
-    client_stream_pos: &mut usize,
-) -> String {
-    let mut byte = vec![0u8; 1];
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut decoded_request = String::new();
-
-    loop {
-        let res = reader.read_exact(&mut byte);
-
-        if res.is_err() {
-            return decoded_request;
-        }
-
-        let decoded_byte = decode(&byte, cipher.clone(), client_stream_pos);
-        decoded_request.push_str(decoded_byte.as_str());
-
-        if decoded_byte == "\n" {
-            break;
-        }
-    }
-
-    decoded_request
-}
-
-fn handle_client(mut stream: TcpStream) {
-    let mut client_stream_pos = 0usize;
-    let mut server_stream_pos = 0usize;
-
-    let cipher = read_cipher(&mut stream);
-
-    if check_cipher_validity(cipher.clone()) {
-        log_with_thread_id("Cipher is valid");
-    } else {
-        log_with_thread_id("Cipher is invalid");
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-        return;
-    }
-
-    loop {
-        log_with_thread_id("Ready to receive request");
-        let decoded_request =
-            read_request_and_decode(&mut stream, cipher.clone(), &mut client_stream_pos);
-
-        if decoded_request.is_empty() {
-            log_with_thread_id("No request received, closing connection");
-            break;
-        }
-
-        if !decoded_request.is_ascii() {
-            log_with_thread_id(format!("Client stream pos: {}", client_stream_pos).as_str());
-            log_with_thread_id(format!("Received non-ASCII request: {}", decoded_request).as_str());
-            continue;
-        }
-
-        log_with_thread_id(&format!("Decoded request: {}", decoded_request));
-
-        let response = decoded_request
-            .split(',')
-            .max_by(|a, b| {
-                let a_nr = a
-                    .chars()
-                    .take_while(|c| c.is_numeric())
-                    .collect::<String>()
-                    .parse::<u32>()
-                    .expect("Failed to parse number");
-                let b_nr = b
-                    .chars()
-                    .take_while(|c| c.is_numeric())
-                    .collect::<String>()
-                    .parse::<u32>()
-                    .expect("Failed to parse number");
-
-                a_nr.cmp(&b_nr)
-            })
-            .expect("No valid response found")
-            .trim();
-
-        let mut response = String::from_str(response).unwrap();
-        response.push('\n');
-
-        let encoded_response = encode(response.as_bytes(), cipher.clone(), &mut server_stream_pos);
-
-        stream
-            .write_all(&encoded_response)
-            .expect("Failed to write response");
-        log_with_thread_id(&format!("Sent response: {}", response));
+        });
     }
 }
 
-fn main() {
-    let listener = TcpListener::bind("0.0.0.0:10000").unwrap();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::runtime::Runtime;
 
-    for stream in listener.incoming() {
-        thread::spawn(|| {
-            handle_client(stream.unwrap());
+    #[test]
+    fn basic_toys() {
+        let s = "1x dog,3x car,2x rat\n";
+        assert_eq!(get_most_toys(String::from(s)).unwrap(), "3x car\n");
+    }
+
+    #[test]
+    fn invalid_toys() {
+        let s = "1x dog,3 car,2x rat\n";
+        assert_eq!(
+            get_most_toys(String::from(s)),
+            Err(String::from("Invalid input string"))
+        );
+
+        let s = "\n";
+        assert_eq!(
+            get_most_toys(String::from(s)),
+            Err(String::from("Invalid input string"))
+        );
+    }
+
+    #[test]
+    fn test_handle_client_xor123_addpos_reversebits() {
+        // Cipher: xor(123), addpos, reversebits
+        let cipher = [0x02, 0x7b, 0x05, 0x01, 0x00];
+        // First client request (obfuscated): 4x dog,5x car\n
+        let req1 = [
+            0xf2, 0x20, 0xba, 0x44, 0x18, 0x84, 0xba, 0xaa, 0xd0, 0x26, 0x44, 0xa4, 0xa8, 0x7e,
+        ];
+        // First server response (obfuscated): 5x car\n
+        let resp1 = [0x72, 0x20, 0xba, 0xd8, 0x78, 0x70, 0xee];
+        // Second client request (obfuscated): 3x rat,2x cat\n
+        let req2 = [
+            0x6a, 0x48, 0xd6, 0x58, 0x34, 0x44, 0xd6, 0x7a, 0x98, 0x4e, 0x0c, 0xcc, 0x94, 0x31,
+        ];
+        // Second server response (obfuscated): 3x rat\n
+        let resp2 = [0xf2, 0xd0, 0x26, 0xc8, 0xa4, 0xd8, 0x7e];
+
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let (mut client, server) = tokio::io::duplex(128);
+
+            tokio::spawn(async move {
+                match handle_client(server).await {
+                    Ok(_) => (),
+                    Err(str) => println!("{}", str),
+                }
+            });
+
+            // Write cipher and first request
+            client.write_all(&cipher).await.unwrap();
+            client.write_all(&req1).await.unwrap();
+            client.flush().await.unwrap();
+
+            // Write second request
+            client.write_all(&req2).await.unwrap();
+            client.flush().await.unwrap();
+
+            // Client: read first response
+            let mut buf = [0u8; 7];
+            client.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, &resp1);
+
+            // Client: read second response
+            let mut buf2 = [0u8; 7];
+            client.read_exact(&mut buf2).await.unwrap();
+            assert_eq!(&buf2, &resp2);
         });
     }
 }
